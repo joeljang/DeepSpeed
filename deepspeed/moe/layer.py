@@ -61,7 +61,7 @@ class MoE(torch.nn.Module):
         log_dist(
             f'Creating MoE layer with num_experts: {num_experts} | num_local_experts: {self.num_local_experts} | expert_parallel_size: {ep_size}',
             [0])
-
+        
         assert noisy_gate_policy is None or noisy_gate_policy in ['None', 'Jitter', 'RSample'], \
             'Unsupported noisy_gate_policy: ' + noisy_gate_policy
 
@@ -97,13 +97,13 @@ class MoE(torch.nn.Module):
             if groups.mpu is None:
                 groups._create_expert_and_data_parallel(self.ep_size)
             else:
-                groups._create_expert_data_and_model_parallel(self.ep_size,
+                groups._create_expert_data_and_model_parallel(ep_size=self.ep_size,
                                                               mpu=groups.mpu)
         # Set the group handle for the MOELayer (deepspeed_moe) object
         self.deepspeed_moe._set_ep_group(
             groups._get_expert_parallel_group(self.expert_group_name))
 
-    def forward(self, hidden_states, used_token=None):
+    def forward(self, entities, hidden_states, used_token=None):
         """ MoE forward
 
         Arguments:
@@ -119,7 +119,7 @@ class MoE(torch.nn.Module):
 
             * exp_counts (int): expert count
         """
-        output = self.deepspeed_moe(hidden_states, used_token)
+        output = self.deepspeed_moe(entities, hidden_states, used_token)
         if self.use_residual:
             # Residual MoE
             output_mlp = self.mlp(hidden_states)

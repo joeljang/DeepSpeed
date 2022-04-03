@@ -167,6 +167,46 @@ def _one_hot_to_float(x, num_classes):
     return F.one_hot(x, num_classes=num_classes).float()
 
 
+def customgating(logits: Tensor,
+               capacity_factor: float,
+               min_capacity: int,
+               used_token: Tensor = None,
+               noisy_gate_policy: Optional[str] = None,
+               drop_tokens: bool = True,
+               use_rts: bool = True,
+               use_tutel: bool = False) -> Tuple[Tensor,
+                                                 Tensor,
+                                                 Tensor,
+                                                 Tensor]:
+    gates = logits
+    mask1 = logits
+    
+    capacity = _capacity(gates,
+                         torch.tensor(capacity_factor),
+                         torch.tensor(min_capacity))
+
+    num_experts = int(gates.shape[1])
+    
+    # gating decisions
+    exp_counts = torch.sum(mask1, dim=0).detach().to('cpu')
+    top_idx = _top_idx(mask1, capacity)
+
+    new_mask1 = mask1 * torch.zeros_like(mask1).scatter_(0, top_idx, 1)
+    mask1 = new_mask1
+    locations1 = torch.cumsum(mask1, dim=0) - 1
+
+    # Store the capacity location for each token
+    locations1_s = torch.sum(locations1 * mask1, dim=1)
+
+    # Normalize gate probabilities
+    mask1_float = mask1.float()
+    gates = gates * mask1_float
+    locations1_sc = _one_hot_to_float(locations1_s, capacity)
+    combine_weights = einsum("se,sc->sec", gates, locations1_sc)
+    dispatch_mask = combine_weights.bool()
+    return 0, combine_weights, dispatch_mask, exp_counts
+
+
 def top1gating(logits: Tensor,
                capacity_factor: float,
                min_capacity: int,
@@ -247,15 +287,14 @@ def top1gating(logits: Tensor,
         locations1 = tutel_moe.fast_cumsum_sub_one(mask1)
     else:
         locations1 = torch.cumsum(mask1, dim=0) - 1
-
     if use_tutel:
         gates1_s = (gates * mask1).sum(dim=1)
         locations1_s = torch.sum(locations1 * mask1, dim=1)
         return l_aux, capacity, num_experts, [indices1_s,], [locations1_s,], [gates1_s,], exp_counts
-
+    
     # Store the capacity location for each token
     locations1_s = torch.sum(locations1 * mask1, dim=1)
-
+    
     # Normalize gate probabilities
     mask1_float = mask1.float()
     gates = gates * mask1_float
@@ -267,13 +306,11 @@ def top1gating(logits: Tensor,
 
     return l_aux, combine_weights, dispatch_mask, exp_counts
 
-
 def top2gating(logits: Tensor,
-               capacity_factor: float,
-               min_capacity: int) -> Tuple[Tensor,
-                                           Tensor,
-                                           Tensor,
-                                           Tensor]:
+               capacity_factor: float) -> Tuple[Tensor,
+                                                Tensor,
+                                                Tensor,
+                                                Tensor]:
     """Implements Top2Gating on logits."""
     # everything is in fp32 in this function
     gates = F.softmax(logits, dim=1)
@@ -340,7 +377,6 @@ def top2gating(logits: Tensor,
 
     return l_aux, combine_weights, dispatch_mask, exp_counts
 
-
 class TopKGate(Module):
     """Gate module which implements Top2Gating as described in Gshard_.
     ::
@@ -365,7 +401,7 @@ class TopKGate(Module):
                  k: int = 1,
                  capacity_factor: float = 1.0,
                  eval_capacity_factor: float = 1.0,
-                 min_capacity: int = 8,
+                 min_capacity: int = 0,
                  noisy_gate_policy: Optional[str] = None,
                  drop_tokens: bool = True,
                  use_rts: bool = True) -> None:
@@ -388,12 +424,12 @@ class TopKGate(Module):
 
     def forward(
             self,
+            entities,
             input: torch.Tensor,
             used_token: torch.Tensor = None,
             use_tutel: bool = False) -> Tuple[Tensor,
                                               Tensor,
                                               Tensor]:  # type: ignore
-
         if self.wall_clock_breakdown:
             self.timers('TopKGate').start()
 
@@ -404,10 +440,10 @@ class TopKGate(Module):
         if self.noisy_gate_policy == 'Jitter' and self.training:
             input_fp32 = multiplicative_jitter(input_fp32, device=input.device)
         logits = self.wg(input_fp32)
-
         if self.k == 1:
-            gate_output = top1gating(
-                logits,
+            gate_output = customgating(
+            #gate_output = top1gating(
+                entities,
                 self.capacity_factor if self.training else self.eval_capacity_factor,
                 self.min_capacity,
                 used_token,
@@ -419,13 +455,11 @@ class TopKGate(Module):
         else:
             gate_output = top2gating(
                 logits,
-                self.capacity_factor if self.training else self.eval_capacity_factor,
-                self.min_capacity)
+                self.capacity_factor if self.training else self.eval_capacity_factor)
 
         if self.wall_clock_breakdown:
             self.timers('TopKGate').stop()
             self.gate_time = self.timers('TopKGate').elapsed(reset=False) * 1000
-
         return gate_output
 
 
@@ -477,7 +511,7 @@ class MOELayer(Base):
     def _set_ep_group(self, ep_group):
         self.ep_group = ep_group
 
-    def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
+    def forward(self, entities, *input: Tensor, **kwargs: Any) -> Tensor:
 
         if self.wall_clock_breakdown:
             self.timers('moe').start()
@@ -489,6 +523,7 @@ class MOELayer(Base):
         # Reshape into G groups so that each group can distribute tokens equally
         # group_size = kwargs['group_size'] if 'group_size' in kwargs.keys() else 1
         reshaped_input = input[0].reshape(-1, d_model)
+        reshaped_entities = entities.reshape(d_model * entities.shape[0], -1)
 
         if self.use_tutel:
             self.l_aux, C, E, indices_, locations_, gates_, self.exp_counts = self.gate(reshaped_input, input[1], True)
@@ -503,7 +538,7 @@ class MOELayer(Base):
             self._tutel_dispatcher.update(indices_, locations_, gates_, capacity=C)
             dispatched_input = self._tutel_dispatcher.encode(reshaped_input)
         else:
-            self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_input, input[1])
+            self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_entities, reshaped_input, input[1])
             dispatched_input = einsum("sec,sm->ecm",
                                       dispatch_mask.type_as(input[0]),
                                       reshaped_input)
@@ -522,7 +557,6 @@ class MOELayer(Base):
                                                     self.num_local_experts,
                                                     -1,
                                                     d_model)
-
         expert_output = self.experts(dispatched_input)
 
         if self.wall_clock_breakdown:
@@ -551,5 +585,4 @@ class MOELayer(Base):
         if self.wall_clock_breakdown:
             self.timers('moe').stop()
             self.time_moe = self.timers('moe').elapsed(reset=False) * 1000
-
         return a
